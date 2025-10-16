@@ -14,19 +14,17 @@
   </style>
 </head>
 <body>
-  <h1>Something Went Wrong</h1>
-  <p>I have a suprise For you!</p>
+  <h1>High-Load Browser Benchmark — Safe Mode</h1>
+  <p>Warning & consent: This app will push CPU and GPU heavily. Run only with explicit consent and while plugged into power. The app will refuse to run on battery.</p>
 
   <div id="controls" style="display:flex; justify-content:center; margin-top:40vh;">
-    <button id="start">Click ME</button>
+    <button id="start">Start</button>
   </div>
 
   <div id="status" style="display:none">Idle</div>
 
-  <!-- hidden canvas for GPU work (kept to perform GPU rendering but not shown) -->
-  <canvas id="gpuCanvas" width="3840" height="2160" style="opacity:0; position:fixed; left:0; top:0; width:640px; height:360px; pointer-events:none;"></canvas>
-
-
+  <!-- invisible-but-rendered canvas for GPU work (kept to perform GPU rendering but not visually shown) -->
+    <canvas id="gpuCanvas" width="3840" height="2160" style="display:none; position:fixed; left:0; top:0; width:100vw; height:100vh; background:#000; z-index:9998;"></canvas>
 
 <script>
 /* -------------------------
@@ -36,7 +34,7 @@ async function checkBatteryOK() {
   if (!('getBattery' in navigator)) return true; // unknown, assume OK
   try {
     const bat = await navigator.getBattery();
-    if (bat.level < 0.9) return false;
+    if (!bat.charging && bat.level < 0.9) return false;
     return true;
   } catch (e) { return true; }
 }
@@ -56,16 +54,14 @@ self.onmessage = function(e) {
     for (let i=0;i<N;i++) A[i] = (i+1) * 0.000001;
     let ops = 0;
     function heavyStep() {
-      // micro-batch to avoid posting too frequently
-      // scale per-instance; keep per-worker batch reasonable
-      const batch = 50 + Math.floor(intensity * 40);
+      const batch = 2000 + Math.floor(intensity * 90);
       for (let b=0;b<batch;b++) {
         // for each logical instance assigned to this worker, do inner work
         for (let inst = 0; inst < (instances || 1); inst++) {
           let s = 0;
           for (let i=0;i<500;i+=5) {
             let v = A[(i*7 + inst) % N];
-            v = Math.sqrt(v * (i+1)) + Math.sin(v) * 0.5;
+            v = Math.sqrt(v * (i+1)) * Math.sqrt(v * (i+1)) * Math.sqrt(v * (i+1)) + Math.sin(v) * Math.sqrt(v * (i+1));
             A[(i*3 + inst) % N] = v;
             s += (v * 1.000001) | 0;
           }
@@ -164,27 +160,162 @@ function makeProgram(gl, vsSource, fsSource) {
 
 function createHeavyFragment(loopCount) {
   // loopCount controls the inner loop iterations to scale GPU work
+  // The shader below performs multiple kinds of math: rotations, polynomial transforms,
+  // Fourier-like additive synth, color mapping and smoothstep blending to make output colorful.
   return `
   precision highp float;
   uniform float u_time;
   uniform vec2 u_res;
-  void main() {
-    vec2 uv = (gl_FragCoord.xy / u_res - 0.5) * 2.0;
-    float x = uv.x, y = uv.y;
-    float acc = 0.0;
-    float cx = cos(u_time*0.3), sx = sin(u_time*0.2);
-    for (int i=0;i<${loopCount};i++) {
-      float f = float(i) * 0.6180339;
-      float r = length(vec2(x* (f+1.0), y * (f+1.0)));
-      float v = sin(r* (f+1.0) + u_time*0.001*float(i)) * cos(r*0.7 + cx);
-      acc += pow(abs(v)+0.0001, 0.7) * (1.0 + 0.3*fract(sin(f*12.9898)*43758.5453));
-      float nx = x*cx - y*sx;
-      float ny = x*sx + y*cx;
-      x = nx; y = ny;
+  
+  // 2D rotate
+  mat2 rot(float a){ float c = cos(a), s = sin(a); return mat2(c,-s,s,c); }
+
+  // pseudo-hash
+  float hash21(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453123); }
+
+  // smooth palette
+  vec3 palette(float t, vec3 a, vec3 b, vec3 c, vec3 d){
+    return a + b * cos(6.28318*(c * t + d));
+  }
+
+  uniform float u_idx;
+  
+  // simple pseudo-random generator per tile
+  float prand(float x){ return fract(sin(x*127.1)*43758.5453); }
+
+  // noise / fbm helpers
+  float noise(vec2 p){
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    float a = hash21(i);
+    float b = hash21(i + vec2(1.0, 0.0));
+    float c = hash21(i + vec2(0.0, 1.0));
+    float d = hash21(i + vec2(1.0, 1.0));
+    vec2 u = f*f*(3.0-2.0*f);
+    return mix(a, b, u.x) + (c - a)*u.y*(1.0 - u.x) + (d - b)*u.x*u.y;
+  }
+
+  float fbm(in vec2 p){
+    float v = 0.0;
+    float amp = 0.5;
+    for(int i=0;i<6;i++){
+      v += amp * noise(p);
+      p = p * 2.0 + vec2(0.5,0.2);
+      amp *= 0.5;
     }
-    acc = acc / float(${loopCount});
-    gl_FragColor = vec4(vec3(acc), 1.0);
-  }`;
+    return v;
+  }
+
+  // HSV helpers
+  vec3 rgb2hsv(vec3 c){
+    vec4 K = vec4(0.0, -1.0/3.0, 2.0/3.0, -1.0);
+    vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+    vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+    float d = q.x - min(q.w, q.y);
+    float e = 1.0e-10;
+    return vec3(abs(q.z + (q.w - q.y) / (6.0*d + e)), d / (q.x + e), q.x);
+  }
+
+  vec3 hsv2rgb(vec3 c){
+    vec3 p = abs(fract(c.x + vec3(0.0, 2.0/3.0, 1.0/3.0)) * 6.0 - 3.0);
+    return c.z * mix(vec3(1.0), clamp(p - 1.0, 0.0, 1.0), c.y);
+  }
+
+  // chromatic aberration: shift uv per channel with fbm
+  vec3 chroma(vec2 uv, float t, float seed){
+    float sh = 0.002 + 0.003 * prand(seed + t);
+    float r = fbm((uv + vec2(sh,0.0))*20.0 + t*0.1);
+    float g = fbm((uv)*20.0 + t*0.08);
+    float b = fbm((uv - vec2(sh,0.0))*20.0 + t*0.06);
+    return vec3(r,g,b);
+  }
+
+  void main(){
+    vec2 uv = (gl_FragCoord.xy / u_res - 0.5) * 2.0; // -1..1
+    float aspect = u_res.x / u_res.y;
+    uv.x *= aspect;
+    vec2 p = uv;
+    float T = u_time * 0.001;
+    // accumulate multi-scale signals
+    float acc = 0.0;
+    float acc2 = 0.0;
+    vec3 col = vec3(0.0);
+    // rotation that slowly changes
+    float baseRot = sin(T*0.3)*0.6 + cos(T*0.13)*0.2;
+    p = rot(baseRot) * p;
+    // Fourier-like additive synthesis using varying frequencies and phases
+    for(int i=0;i<${loopCount};i++){
+      float fi = float(i) + 1.0;
+      // frequency scales with golden ratio like pattern
+      float freq = pow(1.3, fi*0.12);
+      float phase = hash21(vec2(fi, fi*0.73)) * 6.28318;
+      float s = sin((p.x*freq + p.y*freq) * (0.5 + 0.3*sin(T*0.1*fi)) + phase + T*0.2*fi);
+      float c = cos((p.y*freq - p.x*freq) * (0.5 + 0.2*cos(T*0.07*fi)) + phase*0.5 - T*0.17*fi);
+      // nonlinear fold and softabs to add complexity
+      float v = sign(s)*pow(abs(s), 0.9) * (0.7 + 0.3*c);
+      acc += v * (1.0/fi);
+      acc2 += (s*c) * (0.5/fi);
+      // color contribution per band
+      col += palette(fract(fi*0.13 + acc*0.02), vec3(0.5), vec3(0.5), vec3(1.0), vec3(0.0)) * (0.02/fi);
+      // small local perturbation
+      p += 0.001 * vec2(s,c);
+    }
+
+    // matrix-style polynomial combination
+    float a = acc * 0.6 + acc2 * 0.4;
+    float aa = a;
+    for(int k=0;k<4;k++) aa = aa*aa*0.5 + 0.1*aa; // iterate a few nonlinear ops
+
+  // make a small 4x4 collage inside each tile
+  // map uv from -1..1 to 0..1 local
+  vec2 luv = uv * 0.5 + 0.5;
+  // small grid
+  float gridN = 4.0;
+  vec2 cell = floor(luv * gridN);
+  vec2 cellUV = fract(luv * gridN) * 2.0 - 1.0; // -1..1 inside cell
+  // compute a per-cell variation seeded by tile index and cell coords
+  float seed = u_idx * 37.0 + cell.x*7.0 + cell.y*13.0;
+  float tone = prand(seed + T*0.1);
+  float r = length(cellUV);
+  float rings = sin(r*10.0 - T*0.5 + aa*2.0 + tone*6.0);
+  float mask = smoothstep(0.25, 0.0, abs(rings));
+
+    // combine base color with palette and band-synth color
+    vec3 base = palette(fract(a*0.17 + T*0.01), vec3(0.2,0.25,0.3), vec3(0.8,0.6,0.5), vec3(1.0,1.0,1.0), vec3(0.0,0.33,0.66));
+    col = mix(base, col, 0.7) * (0.6 + 0.4*mask);
+
+    // apply soft vignette
+    float vign = smoothstep(1.0, 0.4, r);
+    col *= vign;
+
+    // add FBM-based microstructure to increase perceived detail
+    float micro = fbm(uv*30.0 + vec2(T*0.02));
+    col += 0.12 * vec3(micro);
+
+    // add chromatic aberration via FBM per channel
+    vec3 ch = chroma(uv, T*0.1, u_idx);
+    col += 0.08 * ch;
+
+    // convert to HSV, boost saturation and vibrance, then back
+    vec3 hsv = rgb2hsv(col);
+    hsv.y = pow(hsv.y, 0.7) * 1.45; // increase saturation more aggressively
+    hsv.z = pow(hsv.z, 0.95);
+    col = hsv2rgb(hsv);
+
+    // subtle filmic tone mapping + contrast
+    col = col/(col + vec3(1.0));
+    col = pow(col, vec3(0.92));
+
+    // add a thin frame between cells like photo borders
+    vec2 border = smoothstep(0.04, 0.03, abs(fract(luv*gridN)-0.5));
+    float bmask = min(border.x, border.y);
+    vec3 framed = mix(vec3(0.06), col, bmask);
+    // subtle per-tile tint
+    float tint = prand(u_idx*0.123 + 0.42);
+    framed *= mix(0.85, 1.15, tint);
+    gl_FragColor = vec4(clamp(framed, 0.0, 1.0), 1.0);
+  }
+  `;
 }
 
 /* We'll dynamically generate the fragment shader with a loop count based on user complexity. */
@@ -217,6 +348,7 @@ function startGPU(canvas, complexity) {
   gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
   timeLoc = gl.getUniformLocation(program, 'u_time');
   resLoc = gl.getUniformLocation(program, 'u_res');
+  const idxLoc = gl.getUniformLocation(program, 'u_idx');
 
   startTime = performance.now();
   gpuFrameCount = 0;
@@ -228,16 +360,27 @@ function startGPU(canvas, complexity) {
   function frame() {
     if (requestedStop) return;
     const t = performance.now() - startTime;
-    gl.viewport(0,0,canvas.width, canvas.height);
     gl.useProgram(program);
-    gl.uniform1f(timeLoc, t);
     gl.uniform2f(resLoc, canvas.width, canvas.height);
-    // simulate many parallel draws by repeating the full-screen draw multiple times
-    const draws = Math.max(1, program._instances || 1);
-    for (let di = 0; di < draws; di++) {
-      // inject a per-instance time offset to vary the workload
-      gl.uniform1f(timeLoc, t + di * 0.001);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    // draw many small tiles across the canvas
+    const total = Math.max(1, program._instances || 1);
+    // compute tile grid (try square-ish)
+    const cols = Math.ceil(Math.sqrt(total));
+    const rows = Math.ceil(total / cols);
+    const tileW = Math.max(1, Math.floor(canvas.width / cols));
+    const tileH = Math.max(1, Math.floor(canvas.height / rows));
+    let drawn = 0;
+    for (let r = 0; r < rows && drawn < total; r++) {
+      for (let c = 0; c < cols && drawn < total; c++) {
+        const x = c * tileW;
+        const y = r * tileH;
+        gl.viewport(x, y, tileW, tileH);
+        gl.uniform1f(timeLoc, t + drawn * 0.001);
+        gl.uniform2f(resLoc, tileW, tileH);
+        if (idxLoc) gl.uniform1f(idxLoc, drawn);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        drawn++;
+      }
     }
     gpuFrameCount++;
     // collect per-second samples
@@ -316,10 +459,12 @@ startBtn.addEventListener('click', async () => {
   const warmupMs = 3000;
   // CPU and GPU instances per new request
   const cpuInstances = 5000;
-  const gpuInstances = 10000;
+  const gpuInstances = 5000;
   const instancesPerWorker = Math.max(1, Math.floor(cpuInstances / cores));
   spawnWorkers(cores, intensity, durationMs + warmupMs, warmupMs, instancesPerWorker);
   // start GPU with GPU instance count; set draws per frame to gpuInstances
+  // show canvas and start GPU
+  gpuCanvas.style.display = 'block';
   startGPU(gpuCanvas, shaderComplex);
   if (program) program._instances = gpuInstances;
 
@@ -340,6 +485,8 @@ function finalizeRun(manual=false) {
   terminateWorkers();
   stopGPU();
   startBtn.disabled = false;
+  // hide canvas after finishing
+  try { document.getElementById('gpuCanvas').style.display = 'none'; } catch(e){}
   // compute aggregate stats
   const cpuOps = cpuSamples.map(s=>s.ops||0);
   const gpuFps = gpuSamples.map(s=>s.fps||0);
